@@ -35,6 +35,21 @@ trap {
     Write-Host "  Practical next step: wait a few minutes, then rerun and reuse an existing App Service Plan instead of creating a new one." -ForegroundColor Cyan
     Write-Host "  Official doc: https://learn.microsoft.com/azure/azure-resource-manager/management/request-limits-and-throttling" -ForegroundColor DarkGray
   }
+  if ($message -match "(?i)additional quota|Basic VMs|quota is 0|without additional quota") {
+    Write-Host ""
+    Write-Host "Azure quota guidance" -ForegroundColor Yellow
+    Write-Host "  This subscription/region has no available quota for the selected App Service plan family." -ForegroundColor Cyan
+    Write-Host "  Try another region first, for example westeurope, uksouth, or northeurope." -ForegroundColor Cyan
+    Write-Host "  If every region fails, request quota increase for Basic VMs/App Service, upgrade the subscription, or reuse an existing App Service Plan." -ForegroundColor Cyan
+  }
+  if ($message -match "(?i)did not start|failed to start|worker.*start|ZIP deployment") {
+    Write-Host ""
+    Write-Host "App startup guidance" -ForegroundColor Yellow
+    Write-Host "  Azure received the ZIP, but the Node app did not become healthy in time." -ForegroundColor Cyan
+    Write-Host "  Check that TARGET_DOMAIN starts with https:// or http:// and includes the upstream port." -ForegroundColor Cyan
+    Write-Host "  If NODE:22-lts is not available in the selected region, rerun Custom Build and try NODE:20-lts." -ForegroundColor Cyan
+    Write-Host "  The debug log contains the Azure/Kudu log URL when Azure returns one." -ForegroundColor Cyan
+  }
   if (-not [string]::IsNullOrWhiteSpace($script:DebugLogPath)) {
     Write-Host ("Debug log: {0}" -f $script:DebugLogPath) -ForegroundColor Yellow
   }
@@ -78,11 +93,36 @@ function Read-OptionalInt([string]$Prompt, [int]$DefaultValue, [int]$MinValue) {
   }
 }
 
+function Test-CommandAvailable([string]$Name) {
+  return [bool](Get-Command $Name -ErrorAction SilentlyContinue)
+}
+
 function Normalize-PathLike([string]$Value) {
   $v = ([string]$Value).Trim()
   if ([string]::IsNullOrWhiteSpace($v)) { return "/api" }
   if (-not $v.StartsWith("/")) { $v = "/$v" }
   if ($v.Length -gt 1 -and $v.EndsWith("/")) { $v = $v.TrimEnd("/") }
+  return $v
+}
+
+function Normalize-TargetDomain([string]$Value) {
+  $v = ([string]$Value).Trim().TrimEnd("/")
+  if ([string]::IsNullOrWhiteSpace($v)) { throw "TARGET_DOMAIN is required." }
+  if ($v -notmatch '^https?://') {
+    throw "TARGET_DOMAIN must start with https:// or http:// and include the upstream inbound host/port. Example: https://your-domain.com:443"
+  }
+  try {
+    $uri = [uri]$v
+    if ([string]::IsNullOrWhiteSpace($uri.Host)) { throw "missing host" }
+    if ($uri.IsDefaultPort) {
+      Write-Host "Warning: TARGET_DOMAIN has no explicit port. If your inbound uses a custom port, include it like :2053." -ForegroundColor Yellow
+    }
+  } catch {
+    throw "TARGET_DOMAIN is not a valid URL. Example: https://your-domain.com:443"
+  }
+  if ($v -match '^http://') {
+    Write-Host "Warning: TARGET_DOMAIN uses http://. If your inbound uses TLS, use https:// to avoid SSL/client test failures." -ForegroundColor Yellow
+  }
   return $v
 }
 
@@ -385,6 +425,54 @@ function Ensure-AzureCliInstalled {
   throw "Azure CLI is required before deploy."
 }
 
+function Ensure-NodeBuildRuntime {
+  Refresh-CurrentProcessPath
+  if (Test-CommandAvailable "node") { return }
+
+  Write-Host ""
+  Write-Host "Node.js LTS is required to generate the static frontend before deploy." -ForegroundColor Yellow
+  Write-Host "This installer can try to install Node.js LTS with winget." -ForegroundColor Cyan
+
+  if (Test-CommandAvailable "winget") {
+    $installNode = Read-Default "Install Node.js LTS now? (Y/n)" "y"
+    if ($installNode.Trim().ToLowerInvariant() -ne "n") {
+      Write-Host ""
+      Write-Host ">> Installing Node.js LTS with winget..." -ForegroundColor Yellow
+      Write-DebugLog "Node.js LTS winget install started."
+      $oldErrorActionPreference = $ErrorActionPreference
+      $output = @()
+      $exitCode = 1
+      try {
+        $ErrorActionPreference = "Continue"
+        $output = & winget install --id OpenJS.NodeJS.LTS -e --silent --accept-package-agreements --accept-source-agreements 2>&1
+        $exitCode = $LASTEXITCODE
+      } finally {
+        $ErrorActionPreference = $oldErrorActionPreference
+      }
+      if (-not [string]::IsNullOrWhiteSpace(($output -join "`n"))) {
+        Write-DebugLog ("winget Node.js output: {0}" -f (($output | ForEach-Object { [string]$_ }) -join "`n").Trim())
+      }
+      if ($exitCode -ne 0) {
+        throw "Node.js LTS install failed. Install it manually from https://nodejs.org/en/download and rerun this installer."
+      }
+      Refresh-CurrentProcessPath
+      if (Test-CommandAvailable "node") {
+        Write-Host "Node.js LTS installed." -ForegroundColor Green
+        return
+      }
+      Write-Host "Node.js install finished, but this terminal still cannot find node.exe." -ForegroundColor Yellow
+      Write-Host "Open a new terminal and run this installer again." -ForegroundColor Yellow
+      throw "Node.js LTS was installed but node.exe was not found in PATH."
+    }
+  } else {
+    Write-Host "winget was not found on this Windows system." -ForegroundColor Yellow
+  }
+
+  Write-Host ""
+  Write-Host "Manual install: https://nodejs.org/en/download" -ForegroundColor Yellow
+  throw "Node.js LTS is required before deploy. Install Node.js, open a new terminal, and run this installer again."
+}
+
 function Get-UpstreamHostFromDomain([string]$TargetDomain) {
   if ([string]::IsNullOrWhiteSpace($TargetDomain)) { return "" }
   $raw = $TargetDomain.Trim()
@@ -651,6 +739,7 @@ function Invoke-Az([string[]]$ArgsList, [string]$Label = "") {
     Write-DebugLog ("AZ FAILED exit={0}: az {1}" -f $exitCode, ($azArgs -join " "))
     if (-not [string]::IsNullOrWhiteSpace($text)) {
       $lastLine = @($text -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) | Select-Object -Last 1
+      $errorLine = @($text -split "`r?`n" | Where-Object { $_ -match "^\s*ERROR:" }) | Select-Object -First 1
       if ($text -match "(?i)throttled|too many requests") {
         $retryAfter = ""
         if ($text -match "(?i)retry-after[^0-9]*(\d+)") {
@@ -663,9 +752,16 @@ function Invoke-Az([string[]]$ArgsList, [string]$Label = "") {
         }
         throw ("{0}: Azure throttled this create/update operation. {1}. See the guidance below." -f $(if ($Label) { $Label } else { "Azure operation" }), $waitText)
       }
+      if ($text -match "(?i)without additional quota|additional quota|Current Limit.*Basic VMs|Amount required.*Basic VMs") {
+        throw ("{0}: Azure quota is 0 or insufficient for this App Service plan family in the selected region/subscription. Try another region first; if it still fails, request quota increase for Basic VMs/App Service, upgrade the subscription, or reuse an existing App Service Plan." -f $(if ($Label) { $Label } else { "App Service plan" }))
+      }
       if ($text -match "not allowed to create or update the serverfarm") {
         throw ("{0}: Azure rejected this App Service plan SKU for the current subscription/region. For Free Trial credit, use B1, B2, or B3; if it still fails, try another region such as westeurope, uksouth, or northeurope." -f $(if ($Label) { $Label } else { "App Service plan" }))
       }
+      if ($text -match "(?i)failed to start within 10 mins|worker proccess failed to start|worker process failed to start|site failed to start") {
+        throw ("{0}: Azure deployed the ZIP, but the Node app did not start in time. Check that TARGET_DOMAIN includes https:// or http:// plus the port, inspect the Azure/Kudu log URL in the debug log, and try NODE:20-lts if NODE:22-lts is unsupported in that region." -f $(if ($Label) { $Label } else { "ZIP deployment" }))
+      }
+      if (-not [string]::IsNullOrWhiteSpace($errorLine)) { throw ("{0}: {1}" -f $(if ($Label) { $Label } else { "az command failed" }), $errorLine.Trim()) }
       if (-not [string]::IsNullOrWhiteSpace($lastLine)) { throw ("{0}: {1}" -f $(if ($Label) { $Label } else { "az command failed" }), $lastLine) }
     }
     throw ("az command failed: az {0}" -f ($ArgsList -join " "))
@@ -681,6 +777,27 @@ function Test-AzCommand([string[]]$ArgsList) {
   $result = Invoke-AzQuiet -ArgsList $ArgsList
   Write-DebugLog ("TEST AZ exit={0}: az {1}" -f $result.ExitCode, ($ArgsList -join " "))
   return ($result.ExitCode -eq 0)
+}
+
+function Test-DeployedHealth([string]$BaseUrl) {
+  if ([string]::IsNullOrWhiteSpace($BaseUrl)) { return }
+  Write-Host ("  ..  Health check") -ForegroundColor DarkCyan
+  $healthUrl = $BaseUrl.TrimEnd("/") + "/health"
+  for ($i = 1; $i -le 12; $i++) {
+    try {
+      $response = Invoke-WebRequest -Uri $healthUrl -UseBasicParsing -TimeoutSec 10
+      if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 300) {
+        Write-StepDone -Label "Health check" -Detail $healthUrl
+        Write-DebugLog ("Health check OK: {0}" -f $healthUrl)
+        return
+      }
+    } catch {
+      Write-DebugLog ("Health check attempt {0} failed: {1}" -f $i, $_.Exception.Message)
+    }
+    Start-Sleep -Seconds 5
+  }
+  Write-Host ("  !!  Health check did not return 2xx yet: {0}" -f $healthUrl) -ForegroundColor Yellow
+  Write-Host "      The deploy can still be warming up. If client tests fail with HTTP 000, check Azure app logs." -ForegroundColor Yellow
 }
 
 function Select-AzureSubscription([string]$PreferredSubscriptionId) {
@@ -893,7 +1010,7 @@ Write-Host "TARGET_DOMAIN" -ForegroundColor Cyan
 Write-Host "  Enter the upstream inbound address, including protocol, domain/IP, and port." -ForegroundColor DarkGray
 Write-Host "  This is the address of the server/inbound you want Azure to relay to." -ForegroundColor DarkGray
 Write-Host "  Examples: https://your-domain.com:443  or  https://dedf.example.site:2053" -ForegroundColor DarkGray
-$TargetDomain = Read-Required "TARGET_DOMAIN upstream inbound URL" $TargetDomain
+$TargetDomain = Normalize-TargetDomain (Read-Required "TARGET_DOMAIN upstream inbound URL" $TargetDomain)
 $Location = Choose-AzureLocation -TargetDomain $TargetDomain -CurrentDefault $Location
 
 Write-Host ""
@@ -941,21 +1058,23 @@ if ($confirm.Trim().ToLowerInvariant() -eq "n") { exit 0 }
 
 Write-Host ""
 Write-Section "Building static frontend"
+Ensure-NodeBuildRuntime
 $env:TARGET_DOMAIN = $TargetDomain.TrimEnd("/")
 $env:RELAY_PATH = $RelayPath
 $env:PUBLIC_RELAY_PATH = $PublicRelayPath
+$buildScript = Join-Path $scriptDir "scripts\prepare-build.mjs"
 $oldErrorActionPreference = $ErrorActionPreference
 try {
   $ErrorActionPreference = "Continue"
-  $buildOutput = npm run build --silent 2>&1
+  $buildOutput = & node $buildScript 2>&1
   $buildExitCode = $LASTEXITCODE
 } finally {
   $ErrorActionPreference = $oldErrorActionPreference
 }
 if (-not [string]::IsNullOrWhiteSpace(($buildOutput -join "`n"))) {
-  Write-DebugLog ("npm build output: {0}" -f (($buildOutput | ForEach-Object { [string]$_ }) -join "`n").Trim())
+  Write-DebugLog ("frontend build output: {0}" -f (($buildOutput | ForEach-Object { [string]$_ }) -join "`n").Trim())
 }
-if ($buildExitCode -ne 0) { throw "npm run build failed." }
+if ($buildExitCode -ne 0) { throw "Static frontend build failed. Make sure Node.js LTS is installed and rerun this installer." }
 Write-StepDone -Label "Static frontend" -Detail "public/ generated"
 
 Write-Host ""
@@ -1023,6 +1142,7 @@ Invoke-Az -ArgsList @("webapp", "deploy", "--resource-group", $ResourceGroup, "-
 Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
 
 $url = "https://$AppName.azurewebsites.net"
+Test-DeployedHealth -BaseUrl $url
 Write-Host ""
 Write-Host "==============================================" -ForegroundColor Green
 Write-Host "Azure deployment complete." -ForegroundColor Green
