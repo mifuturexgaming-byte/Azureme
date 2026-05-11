@@ -228,6 +228,17 @@ function Format-Bytes([double]$Bytes) {
   return ("{0:0} B" -f $Bytes)
 }
 
+function Get-AzureThrottleRetryDelaySeconds([string]$Text, [int]$Attempt) {
+  if ($Text -match "(?i)retry-after[^0-9]*(\d+)") {
+    $retryAfter = [int]$Matches[1]
+    if ($retryAfter -gt 0) { return [Math]::Min($retryAfter, 300) }
+  }
+
+  $fallback = @(30, 60, 120)
+  $index = [Math]::Min([Math]::Max($Attempt - 1, 0), $fallback.Count - 1)
+  return $fallback[$index]
+}
+
 function Get-MsiExitMessage([int]$Code) {
   switch ($Code) {
     0 { return "Success" }
@@ -714,29 +725,50 @@ function Invoke-Az([string[]]$ArgsList, [string]$Label = "") {
   if ($azArgs -notcontains "--only-show-errors") { $azArgs += "--only-show-errors" }
   if (($azArgs -notcontains "--output") -and ($azArgs -notcontains "-o")) { $azArgs += @("--output", "none") }
 
-  Write-DebugLog ("RUN: az {0}" -f ($azArgs -join " "))
-  if (-not [string]::IsNullOrWhiteSpace($Label)) {
-    Write-Host ("  ..  {0}" -f $Label) -ForegroundColor DarkCyan
-  }
+  $maxAttempts = 4
+  for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+    Write-DebugLog ("RUN attempt {0}/{1}: az {2}" -f $attempt, $maxAttempts, ($azArgs -join " "))
+    if (-not [string]::IsNullOrWhiteSpace($Label)) {
+      if ($attempt -eq 1) {
+        Write-Host ("  ..  {0}" -f $Label) -ForegroundColor DarkCyan
+      } else {
+        Write-Host ("  ..  {0} retry {1}/{2}" -f $Label, $attempt, $maxAttempts) -ForegroundColor DarkCyan
+      }
+    }
 
-  $oldErrorActionPreference = $ErrorActionPreference
-  $output = @()
-  $exitCode = 1
-  try {
-    $ErrorActionPreference = "Continue"
-    $output = & az @azArgs 2>&1
-    $exitCode = $LASTEXITCODE
-  } finally {
-    $ErrorActionPreference = $oldErrorActionPreference
-  }
+    $oldErrorActionPreference = $ErrorActionPreference
+    $output = @()
+    $exitCode = 1
+    try {
+      $ErrorActionPreference = "Continue"
+      $output = & az @azArgs 2>&1
+      $exitCode = $LASTEXITCODE
+    } finally {
+      $ErrorActionPreference = $oldErrorActionPreference
+    }
 
-  $text = (($output | ForEach-Object { [string]$_ }) -join "`n").Trim()
-  if (-not [string]::IsNullOrWhiteSpace($text)) {
-    Write-DebugLog ("AZ output: {0}" -f $text)
-  }
+    $text = (($output | ForEach-Object { [string]$_ }) -join "`n").Trim()
+    if (-not [string]::IsNullOrWhiteSpace($text)) {
+      Write-DebugLog ("AZ output attempt {0}: {1}" -f $attempt, $text)
+    }
 
-  if ($exitCode -ne 0) {
-    Write-DebugLog ("AZ FAILED exit={0}: az {1}" -f $exitCode, ($azArgs -join " "))
+    if ($exitCode -eq 0) {
+      Write-DebugLog ("AZ OK: az {0}" -f ($azArgs -join " "))
+      if (-not [string]::IsNullOrWhiteSpace($Label)) {
+        Write-StepDone -Label $Label
+      }
+      return
+    }
+
+    Write-DebugLog ("AZ FAILED attempt {0}/{1} exit={2}: az {3}" -f $attempt, $maxAttempts, $exitCode, ($azArgs -join " "))
+    if ($text -match "(?i)throttled|too many requests" -and $attempt -lt $maxAttempts) {
+      $delaySeconds = Get-AzureThrottleRetryDelaySeconds -Text $text -Attempt $attempt
+      Write-DebugLog ("Azure throttled operation. Waiting {0}s before retry." -f $delaySeconds)
+      Write-Host ("  !!  Azure throttled this step. Waiting {0}s before retry {1}/{2}..." -f $delaySeconds, ($attempt + 1), $maxAttempts) -ForegroundColor Yellow
+      Start-Sleep -Seconds $delaySeconds
+      continue
+    }
+
     if (-not [string]::IsNullOrWhiteSpace($text)) {
       $lastLine = @($text -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) | Select-Object -Last 1
       $errorLine = @($text -split "`r?`n" | Where-Object { $_ -match "^\s*ERROR:" }) | Select-Object -First 1
@@ -765,11 +797,6 @@ function Invoke-Az([string[]]$ArgsList, [string]$Label = "") {
       if (-not [string]::IsNullOrWhiteSpace($lastLine)) { throw ("{0}: {1}" -f $(if ($Label) { $Label } else { "az command failed" }), $lastLine) }
     }
     throw ("az command failed: az {0}" -f ($ArgsList -join " "))
-  }
-
-  Write-DebugLog ("AZ OK: az {0}" -f ($azArgs -join " "))
-  if (-not [string]::IsNullOrWhiteSpace($Label)) {
-    Write-StepDone -Label $Label
   }
 }
 
