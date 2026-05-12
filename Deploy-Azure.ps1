@@ -722,6 +722,27 @@ function Ensure-AzureCliLogin {
     $account = Invoke-AzQuiet -ArgsList @("account", "show", "--query", "{name:name,id:id,user:user.name}", "--output", "tsv")
     if ($account.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($account.Output)) {
       Write-Host "Azure CLI already logged in." -ForegroundColor Green
+      $parts = @($account.Output -split "`t")
+      $accountName = if ($parts.Count -ge 1) { $parts[0] } else { "" }
+      $accountId = if ($parts.Count -ge 2) { $parts[1] } else { "" }
+      $accountUser = if ($parts.Count -ge 3) { $parts[2] } else { "" }
+      if (-not [string]::IsNullOrWhiteSpace($accountUser)) {
+        Write-Host ("  Account: {0}" -f $accountUser) -ForegroundColor Cyan
+      }
+      if (-not [string]::IsNullOrWhiteSpace($accountName)) {
+        Write-Host ("  Subscription: {0} ({1})" -f $accountName, $accountId) -ForegroundColor Cyan
+      }
+
+      $useCurrentAccount = Read-Default "Use this Azure account? (Y/n)" "y"
+      if ($useCurrentAccount.Trim().ToLowerInvariant() -eq "n") {
+        Write-Host ""
+        Write-Host "Signing out from the current Azure CLI account..." -ForegroundColor Yellow
+        Invoke-Az -ArgsList @("logout") -Label "Azure logout"
+        $null = Invoke-AzQuiet -ArgsList @("account", "clear")
+        Write-Host ""
+        Write-Host "Sign in with the Azure account you want to use." -ForegroundColor Cyan
+        Invoke-AzureDeviceLogin
+      }
     }
   }
 }
