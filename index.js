@@ -100,6 +100,8 @@ async function handleRelay(req, res, url, normalizedPath) {
   const startedAt = Date.now();
   let slotAcquired = false;
   let hitUpstreamTimeout = false;
+  let upstreamPath = "";
+  let targetUrl = "";
 
   if (!TARGET_BASE) return textNodeResponse(res, 500, "Misconfigured: TARGET_DOMAIN is not set");
   if (!RELAY_PATH) return textNodeResponse(res, 500, "Misconfigured: RELAY_PATH is not set");
@@ -122,8 +124,8 @@ async function handleRelay(req, res, url, normalizedPath) {
     }
     slotAcquired = true;
 
-    const upstreamPath = mapPublicPathToRelayPath(normalizedPath, PUBLIC_RELAY_PATH, RELAY_PATH);
-    const targetUrl = `${TARGET_BASE}${upstreamPath}${url.search || ""}`;
+    upstreamPath = mapPublicPathToRelayPath(normalizedPath, PUBLIC_RELAY_PATH, RELAY_PATH);
+    targetUrl = `${TARGET_BASE}${upstreamPath}${url.search || ""}`;
     const abortCtrl = new AbortController();
     const timeoutRef = UPSTREAM_TIMEOUT_MS > 0
       ? setTimeout(() => {
@@ -193,7 +195,9 @@ async function handleRelay(req, res, url, normalizedPath) {
       requestId,
       method: req.method,
       durationMs,
-      error: String(err),
+      path: normalizedPath,
+      upstreamPath,
+      ...describeRelayError(err, targetUrl),
     });
     if (!res.headersSent) return textNodeResponse(res, 502, "Bad Gateway: Tunnel Failed");
   } finally {
@@ -362,6 +366,43 @@ function isUpstreamTimeoutError(err) {
   if (err?.message === "upstream_timeout") return true;
   if (err?.cause?.message === "upstream_timeout") return true;
   return typeof err === "string" && err === "upstream_timeout";
+}
+
+function describeRelayError(err, targetUrl) {
+  const cause = err?.cause || {};
+  const code = String(cause.code || err?.code || "");
+  const causeMessage = String(cause.message || "");
+  const message = String(err?.message || err || "");
+  const out = {
+    error: err?.name ? `${err.name}: ${message}` : message,
+    upstreamOrigin: getUrlOrigin(targetUrl),
+  };
+  if (code) out.causeCode = code;
+  if (causeMessage && causeMessage !== message) out.causeMessage = causeMessage;
+
+  const combined = `${code} ${causeMessage} ${message}`.toLowerCase();
+  if (combined.includes("enotfound") || combined.includes("eai_again")) {
+    out.hint = "Upstream DNS failed from Azure. Check TARGET_DOMAIN host and DNS records.";
+  } else if (combined.includes("econnrefused")) {
+    out.hint = "Upstream refused the TCP connection. Check inbound port/firewall.";
+  } else if (combined.includes("timeout") || combined.includes("und_err_connect_timeout")) {
+    out.hint = "Azure could not connect to upstream before timeout. Check port reachability and upstream firewall.";
+  } else if (combined.includes("certificate") || combined.includes("cert_") || combined.includes("tls") || combined.includes("ssl")) {
+    out.hint = "TLS/SSL failed. Check TARGET_DOMAIN uses the correct https host and certificate/SNI.";
+  } else if (combined.includes("econnreset")) {
+    out.hint = "Upstream reset the connection. Check inbound service, CDN/proxy rules, and TLS settings.";
+  } else if (message === "fetch failed") {
+    out.hint = "Azure could not reach the upstream. Check TARGET_DOMAIN protocol, port, DNS, firewall, and TLS.";
+  }
+  return out;
+}
+
+function getUrlOrigin(rawUrl) {
+  try {
+    return new URL(rawUrl).origin;
+  } catch {
+    return "";
+  }
 }
 
 function isAllowedRelayPath(pathname, publicPath) {

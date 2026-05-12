@@ -690,6 +690,10 @@ function Invoke-AzureDeviceLogin {
       return
     }
 
+    if ($loginText -match "(?i)No subscriptions found") {
+      throw "Azure login succeeded, but this account has no active Azure subscription. Open https://portal.azure.com, activate Free Trial or Pay-As-You-Go, or sign in with an account that has an enabled subscription."
+    }
+
     Write-DebugLog ("az login failed attempt {0}/{1} exit={2}" -f $attempt, $maxAttempts, $loginExitCode)
     if ($attempt -lt $maxAttempts) {
       Write-Host ""
