@@ -657,6 +657,53 @@ function Choose-AzureLocation([string]$TargetDomain, [string]$CurrentDefault) {
   }
 }
 
+function Invoke-AzureDeviceLogin {
+  $maxAttempts = 2
+  for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+    if ($attempt -gt 1) {
+      Write-Host ""
+      Write-Host ("Azure login retry {0}/{1}" -f $attempt, $maxAttempts) -ForegroundColor Yellow
+      Write-Host "If the previous code expired or was not completed, use the new code shown below." -ForegroundColor Cyan
+    }
+
+    Write-DebugLog ("Running az login --use-device-code attempt {0}/{1}." -f $attempt, $maxAttempts)
+    $oldErrorActionPreference = $ErrorActionPreference
+    $loginOutput = @()
+    $loginExitCode = 1
+    try {
+      $ErrorActionPreference = "Continue"
+      Remove-Variable -Name capturedLoginOutput -ErrorAction SilentlyContinue
+      & az login --use-device-code --output none 2>&1 | Tee-Object -Variable capturedLoginOutput | Out-Host
+      $loginExitCode = $LASTEXITCODE
+      if ($null -ne $capturedLoginOutput) { $loginOutput = @($capturedLoginOutput) }
+    } finally {
+      $ErrorActionPreference = $oldErrorActionPreference
+    }
+
+    $loginText = (($loginOutput | ForEach-Object { [string]$_ }) -join "`n").Trim()
+    if (-not [string]::IsNullOrWhiteSpace($loginText)) {
+      Write-DebugLog ("az login output attempt {0}: {1}" -f $attempt, $loginText)
+    }
+
+    if ($loginExitCode -eq 0) {
+      Write-DebugLog "az login completed successfully."
+      return
+    }
+
+    Write-DebugLog ("az login failed attempt {0}/{1} exit={2}" -f $attempt, $maxAttempts, $loginExitCode)
+    if ($attempt -lt $maxAttempts) {
+      Write-Host ""
+      Write-Host "Azure login did not complete." -ForegroundColor Yellow
+      Write-Host "Open the browser page, enter the code, finish Microsoft sign-in, then wait here until it returns." -ForegroundColor Cyan
+      continue
+    }
+
+    $lastLine = @($loginText -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) | Select-Object -Last 1
+    $details = if ([string]::IsNullOrWhiteSpace($lastLine)) { "" } else { " Details: $lastLine" }
+    throw "Azure login failed or timed out. Complete the device-code sign-in in the browser, then rerun this installer.$details"
+  }
+}
+
 function Ensure-AzureCliLogin {
   Ensure-AzureCliInstalled
 
@@ -666,16 +713,7 @@ function Ensure-AzureCliLogin {
     Write-Host "Simple login mode: a code will be shown here; open https://aka.ms/devicelogin and enter it." -ForegroundColor Cyan
     Write-Host "No Service Principal, Client Secret, or manual token is needed." -ForegroundColor Cyan
     Write-Host ""
-    Write-DebugLog "Running az login --use-device-code."
-    $oldErrorActionPreference = $ErrorActionPreference
-    try {
-      $ErrorActionPreference = "Continue"
-      az login --use-device-code --output none | Out-Host
-      $loginExitCode = $LASTEXITCODE
-    } finally {
-      $ErrorActionPreference = $oldErrorActionPreference
-    }
-    if ($loginExitCode -ne 0) { throw "az login failed." }
+    Invoke-AzureDeviceLogin
   } else {
     $account = Invoke-AzQuiet -ArgsList @("account", "show", "--query", "{name:name,id:id,user:user.name}", "--output", "tsv")
     if ($account.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($account.Output)) {
